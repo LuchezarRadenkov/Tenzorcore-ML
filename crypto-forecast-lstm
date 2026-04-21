@@ -1,0 +1,249 @@
+import numpy as np
+import pandas as pd
+import requests
+import time
+import plotly.graph_objects as go
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+# ── 1. Вземи исторически данни ──────────────────────────────
+def get_historical_data(days=365):
+    """Взима данни с retry логика"""
+    for attempt in range(3):
+        try:
+            url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+            params = {"vs_currency": "usd", "days": days, "interval": "daily"}
+            r = requests.get(url, params=params, timeout=15)
+            data = r.json()
+            if "prices" in data:
+                prices  = data["prices"]
+                volumes = data["total_volumes"]
+                df = pd.DataFrame(prices, columns=["timestamp", "price"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+                df["volume"]    = [v[1] for v in volumes]
+                print(f"✅ {len(df)} дни данни заредени от CoinGecko")
+                return df
+            else:
+                print(f"⚠️ Опит {attempt+1}: {data}")
+                time.sleep(10)
+        except Exception as e:
+            print(f"⚠️ Опит {attempt+1} грешка: {e}")
+            time.sleep(10)
+
+    # Резервен вариант - Kraken
+    print("🔄 Опитвам с Kraken API...")
+    url = "https://api.kraken.com/0/public/OHLC"
+    params = {"pair": "XBTUSD", "interval": 1440}
+    r = requests.get(url, params=params, timeout=15)
+    data = r.json()
+    result = data["result"]
+    key = [k for k in result.keys() if k != "last"][0]
+    ohlc = result[key]
+    df = pd.DataFrame(ohlc, columns=[
+        "timestamp","open","high","low","close","vwap","volume","count"
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="s")
+    df["price"]     = df["close"].astype(float)
+    df["volume"]    = df["volume"].astype(float)
+    df = df[["timestamp", "price", "volume"]].tail(365)
+    print(f"✅ {len(df)} дни данни заредени от Kraken")
+    return df
+
+# ── 2. Подготви данните ─────────────────────────────────────
+def prepare_data(df, lookback=60):
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    prices_scaled = scaler.fit_transform(df[["price"]])
+
+    X, y = [], []
+    for i in range(lookback, len(prices_scaled)):
+        X.append(prices_scaled[i-lookback:i, 0])
+        y.append(prices_scaled[i, 0])
+
+    X = np.array(X)
+    y = np.array(y)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
+
+    split   = int(len(X) * 0.8)
+    X_train = X[:split]
+    X_test  = X[split:]
+    y_train = y[:split]
+    y_test  = y[split:]
+
+    return X_train, X_test, y_train, y_test, scaler
+
+# ── 3. Създай LSTM модел ────────────────────────────────────
+def build_model(lookback=60):
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=(lookback, 1)),
+        Dropout(0.2),
+        LSTM(50, return_sequences=False),
+        Dropout(0.2),
+        Dense(25),
+        Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mean_squared_error")
+    return model
+
+# ── 4. Предскажи следващите дни ─────────────────────────────
+def predict_future(model, df, scaler, lookback=60, days_ahead=7):
+    prices_scaled = scaler.transform(df[["price"]])
+    last_sequence = prices_scaled[-lookback:]
+    predictions   = []
+
+    current_seq = last_sequence.copy()
+    for _ in range(days_ahead):
+        x    = current_seq[-lookback:].reshape(1, lookback, 1)
+        pred = model.predict(x, verbose=0)[0][0]
+        predictions.append(pred)
+        current_seq = np.append(current_seq, [[pred]], axis=0)
+
+    predictions = scaler.inverse_transform(
+        np.array(predictions).reshape(-1, 1)
+    ).flatten()
+
+    future_dates = pd.date_range(
+        start=df["timestamp"].iloc[-1] + pd.Timedelta(days=1),
+        periods=days_ahead
+    )
+    return future_dates, predictions
+
+# ── Пусни всичко ────────────────────────────────────────────
+print("📥 Изтеглям данни...")
+df = get_historical_data(days=365)
+print(f"✅ {len(df)} дни данни заредени")
+
+LOOKBACK = 60
+print(f"\n🔄 Подготвям данните (lookback={LOOKBACK} дни)...")
+X_train, X_test, y_train, y_test, scaler = prepare_data(df, lookback=LOOKBACK)
+print(f"✅ Train: {len(X_train)} | Test: {len(X_test)}")
+
+print(f"\n🧠 Създавам LSTM модел...")
+model = build_model(lookback=LOOKBACK)
+model.summary()
+
+print(f"\n⚙️ Тренирам модела...")
+early_stop = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
+history = model.fit(
+    X_train, y_train,
+    epochs=50,
+    batch_size=32,
+    validation_split=0.1,
+    callbacks=[early_stop],
+    verbose=1
+)
+
+# ── Оценка ──────────────────────────────────────────────────
+print(f"\n📊 Оценявам модела...")
+y_pred_scaled = model.predict(X_test, verbose=0)
+y_pred = scaler.inverse_transform(y_pred_scaled).flatten()
+y_true = scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+
+mae  = mean_absolute_error(y_true, y_pred)
+rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+print(f"\n========== РЕЗУЛТАТИ НА МОДЕЛА ==========")
+print(f"MAE  (Mean Absolute Error):      ${mae:,.2f}")
+print(f"RMSE (Root Mean Squared Error):  ${rmse:,.2f}")
+print(f"MAPE (Mean Absolute % Error):    {mape:.2f}%")
+print(f"Точност:                         {100-mape:.2f}%")
+print(f"=========================================")
+
+# ── Предсказване ────────────────────────────────────────────
+DAYS_AHEAD = 7
+print(f"\n🔮 Предсказвам следващите {DAYS_AHEAD} дни...")
+future_dates, future_prices = predict_future(model, df, scaler, LOOKBACK, DAYS_AHEAD)
+
+current_price = df["price"].iloc[-1]
+print(f"\n========== ПРЕДСКАЗАНИ ЦЕНИ ==========")
+print(f"Текуща цена: ${current_price:,.2f}")
+print()
+for date, price in zip(future_dates, future_prices):
+    change = (price - current_price) / current_price * 100
+    emoji  = "📈" if price > current_price else "📉"
+    print(f"{emoji} {date.strftime('%Y-%m-%d')}: ${price:,.2f} ({change:+.2f}%)")
+
+avg_pred  = np.mean(future_prices)
+ml_signal = "BULLISH 📈" if avg_pred > current_price else "BEARISH 📉"
+print(f"\n🔔 ML Сигнал: {ml_signal}")
+print(f"======================================")
+
+# ── Графика ─────────────────────────────────────────────────
+fig = go.Figure()
+
+fig.add_trace(go.Scatter(
+    x=df["timestamp"],
+    y=df["price"],
+    mode="lines",
+    name="Реална цена",
+    line=dict(color="#F7931A", width=2)
+))
+
+test_start = LOOKBACK + int(len(df) * 0.8) - LOOKBACK
+test_dates  = df["timestamp"].iloc[test_start:test_start + len(y_pred)]
+fig.add_trace(go.Scatter(
+    x=test_dates.values,
+    y=y_pred,
+    mode="lines",
+    name="Предсказана цена (тест)",
+    line=dict(color="cyan", width=1.5, dash="dot")
+))
+
+fig.add_trace(go.Scatter(
+    x=future_dates,
+    y=future_prices,
+    mode="lines+markers",
+    name=f"Следващите {DAYS_AHEAD} дни",
+    line=dict(color="lime", width=2, dash="dash"),
+    marker=dict(size=10, color="lime")
+))
+
+fig.add_trace(go.Scatter(
+    x=[df["timestamp"].iloc[-1], df["timestamp"].iloc[-1]],
+    y=[df["price"].min(), df["price"].max()],
+    mode="lines",
+    name="Сега",
+    line=dict(color="white", width=1, dash="dash")
+))
+
+
+fig.update_layout(
+    title=f"LSTM Предсказване на BTC | Точност: {100-mape:.1f}% | Сигнал: {ml_signal}",
+    paper_bgcolor="#0E1117",
+    plot_bgcolor="#0E1117",
+    font=dict(color="white"),
+    xaxis=dict(gridcolor="#1E2130", title="Дата"),
+    yaxis=dict(gridcolor="#1E2130", title="Цена (USD)"),
+    height=600,
+    hovermode="x unified"
+)
+fig.show()
+
+# ── Loss графика ────────────────────────────────────────────
+fig2 = go.Figure()
+fig2.add_trace(go.Scatter(
+    y=history.history["loss"],
+    mode="lines",
+    name="Train Loss",
+    line=dict(color="#F7931A")
+))
+fig2.add_trace(go.Scatter(
+    y=history.history["val_loss"],
+    mode="lines",
+    name="Validation Loss",
+    line=dict(color="cyan")
+))
+fig2.update_layout(
+    title="Процес на обучение на модела",
+    paper_bgcolor="#0E1117",
+    plot_bgcolor="#0E1117",
+    font=dict(color="white"),
+    xaxis=dict(gridcolor="#1E2130", title="Epoch"),
+    yaxis=dict(gridcolor="#1E2130", title="Loss"),
+    height=400
+)
+fig2.show()
